@@ -45,6 +45,8 @@ ROUND_SECONDS = 2             # pause between two rounds of the loop
 FIRST_START_STEP = 20         # commands sent before tick 10 get lost
 LATEST_START_STEP = 300       # first reading of a new run can be late, we saw up to step 257
 STUCK_SECONDS = 90            # step not moving for this long = run failed
+# Kafka eats about 0.5 GiB more per 10,000 steps, so restart it now and then
+RESTART_KAFKA_EVERY_RUNS = 8
 
 API = "http://localhost:8080"
 CROWDNAV_CONTAINER = os.environ.get("CROWDNAV_CONTAINER", "crowdnav")
@@ -72,6 +74,58 @@ def summarise_trips(trips):
     }
 
 
+def find_problems(readings, trips, treatment, knowledge):
+    """Sanity checks on one run. Empty list = the run is fine."""
+    problems = []
+    steps = [reading["step"] for reading in readings]
+    if not steps or steps[-1] < LAST_STEP:
+        problems.append("the run did not reach step %d" % LAST_STEP)
+    if any(later < earlier for earlier, later in zip(steps, steps[1:])):
+        problems.append("the steps did not only go up (old messages mixed in?)")
+
+    if trips is None:
+        problems.append("the trips could not be read from Kafka")
+    elif readings:
+        ticks = [trip["tick"] for trip in trips]
+        final = readings[-1]
+        # trips only count from tick 201, so an earlier first tick = trips of an older run
+        if not ticks or ticks[0] <= 200 or any(later < earlier for earlier, later in zip(ticks, ticks[1:])):
+            problems.append("the trips read are not one clean run")
+        else:
+            up_to_final = sum(1 for tick in ticks if tick <= final["step"])
+            if abs(up_to_final - final["total_trips"]) > 3:
+                problems.append("Kafka has %d trips up to step %d, the monitor says %d"
+                                % (up_to_final, final["step"], final["total_trips"]))
+
+    # only exploration may change during a run, and only in rtx_step runs
+    with_configs = [reading["configs"] for reading in readings if "configs" in reading]
+    for configs in with_configs[1:]:
+        changed = [knob for knob, value in configs.items()
+                   if knob != "exploration_percentage" and float(value) != float(with_configs[0][knob])]
+        if changed:
+            problems.append("knobs other than exploration changed during the run: %s" % ", ".join(sorted(changed)))
+            break
+    if treatment == "no_adaptation" and len({float(c["exploration_percentage"]) for c in with_configs}) > 1:
+        problems.append("exploration changed in a run without adaptation")
+
+    if treatment == "rtx_step":
+        records = list(knowledge["sweep"])
+        if knowledge["applying_best"]:
+            records.append(knowledge["best"])
+        for record in records:
+            if record["sends"] == 0 or record["seen_in_configs_at_step"] is not None:
+                continue
+            # a send in the last round never gets checked by the strategy, so look at later readings too
+            value = record["exploration_percentage"]
+            shown_later = any(reading["step"] > record["sent_at_step"]
+                              and abs(float(reading["exploration_percentage"]) - value) < 1e-9
+                              for reading in readings)
+            if not shown_later:
+                problems.append("exploration %s was sent %d times and never seen in configs"
+                                % (value, record["sends"]))
+    return problems
+
+
 def run_docker(*arguments):
     """Runs one docker command, e.g. run_docker("restart", "kafka")."""
     print("$ docker " + " ".join(arguments))
@@ -85,6 +139,40 @@ def read_step():
         return data["car_stats"]["step"]
     except Exception:
         return None
+
+
+def wait_until_monitor_quiet(max_seconds=300):
+    # after a restart of http-server, /monitor/ first replays old messages
+    # crowdnav is stopped at that point, so we just wait until the step stops changing
+    # False if it never settles or /monitor/ gives no step at all
+    start = time.time()
+    last_step, same_count = None, 0
+    while time.time() - start < max_seconds:
+        step = read_step()
+        # a failed read is not "quiet"
+        if step is not None and step == last_step:
+            same_count += 1
+        else:
+            same_count = 0
+        last_step = step
+        if same_count >= 5:
+            return True
+        time.sleep(1)
+    return False
+
+
+def restart_kafka_and_api():
+    """Restarts Kafka, then the API, which never reconnects by itself."""
+    run_docker("kill", CROWDNAV_CONTAINER)
+    run_docker("restart", "kafka")
+    time.sleep(30)
+    # the API connects to Kafka only once at startup, so give it a second restart if needed
+    for attempt in range(2):
+        run_docker("restart", "http-server")
+        time.sleep(6)
+        if wait_until_monitor_quiet():
+            return
+    print("WARNING: /monitor/ gave no step or was still playing back old messages after two restarts of the API")
 
 
 def wait_for_new_run(stale_step, max_seconds=90):
@@ -132,6 +220,7 @@ class RunnerConfig:
             (RunnerEvents.AFTER_EXPERIMENT , self.after_experiment )
         ])
         self.run_table_model = None
+        self.runs_started = 0
         output.console_log("CrowdNav baseline config loaded")
 
     def create_run_table_model(self) -> RunTableModel:
@@ -146,10 +235,15 @@ class RunnerConfig:
         return self.run_table_model
 
     def before_experiment(self) -> None:
+        """Start from a fresh Kafka, we don't know how many runs it served before."""
+        restart_kafka_and_api()
         output.console_log("Config.before_experiment() called!")
 
     def before_run(self) -> None:
-        """Makes a fresh exemplar and strategy for every run."""
+        """Restarts Kafka every few runs, makes a fresh exemplar and strategy."""
+        self.runs_started += 1
+        if self.runs_started > 1 and (self.runs_started - 1) % RESTART_KAFKA_EVERY_RUNS == 0:
+            restart_kafka_and_api()
         self.exemplar = CrowdNav()
         self.strategy = RtxStepStrategy(self.exemplar, PARAMETERS)
         self.readings = []
@@ -232,7 +326,7 @@ class RunnerConfig:
         output.console_log("Config.stop_run() called!")
 
     def populate_run_data(self, context: RunnerContext) -> Optional[Dict[str, SupportsStr]]:
-        """Reads this run's trips from Kafka and fills one row of the run table."""
+        """Reads this run's trips from Kafka, checks the run, fills one row of the run table."""
         treatment = context.run_variation["treatment"]
         knowledge = self.strategy.knowledge.analysis_data
         row = {column: "" for column in DATA_COLUMNS}
@@ -244,8 +338,7 @@ class RunnerConfig:
             trips = read_new_trips(self.trips_before, expected)
 
         problems = [self.error] if self.error else []
-        if trips is None:
-            problems.append("the trips could not be read from Kafka")
+        problems += find_problems(self.readings, trips, treatment, knowledge)
 
         if trips:
             try:
