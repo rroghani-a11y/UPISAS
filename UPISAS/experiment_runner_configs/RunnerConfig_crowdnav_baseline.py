@@ -4,6 +4,7 @@
 #
 # One run = restart the crowdnav container (so it starts from knobs.json), one round every 2 s
 # until LAST_STEP, then read the run's trips from Kafka and fill one row of the run table.
+# BASELINE_PAPER_SIZES=1 runs the version with the paper's own sample sizes.
 import json
 import os
 import statistics
@@ -32,21 +33,23 @@ sys.path.insert(0, str(UPISAS_REPO))
 sys.path.insert(0, str(HERE))
 
 from UPISAS.exemplars.crowdnav import CrowdNav
-from UPISAS.strategies.crowdnav_rtx_step import RtxStepStrategy, SCALED
+from UPISAS.strategies.crowdnav_rtx_step import RtxStepStrategy, SCALED, PAPER
 from kafka_trips import topic_line_count, read_new_trips
 
 
 # ================================ SETTINGS ================================
-# one tenth of the paper's sample sizes (skip 100 trips, sample 500), so the sweep fits in 10,000 steps
+# default: one tenth of the paper's sample sizes (skip 100 trips, sample 500), 10,000 steps per run
+# BASELINE_PAPER_SIZES=1: the paper's sizes (skip 1000, sample 5000), needs 80,000 steps per run
+PAPER_SIZES = os.environ.get("BASELINE_PAPER_SIZES", "0") == "1"
 REPETITIONS = 5
-PARAMETERS = SCALED
-LAST_STEP = 10000             # run stops here, trips count up to here
+PARAMETERS = PAPER if PAPER_SIZES else SCALED
+LAST_STEP = 80000 if PAPER_SIZES else 10000   # run stops here, trips count up to here
 ROUND_SECONDS = 2             # pause between two rounds of the loop
 FIRST_START_STEP = 20         # commands sent before tick 10 get lost
 LATEST_START_STEP = 300       # first reading of a new run can be late, we saw up to step 257
 STUCK_SECONDS = 90            # step not moving for this long = run failed
 # Kafka eats about 0.5 GiB more per 10,000 steps, so restart it now and then
-RESTART_KAFKA_EVERY_RUNS = 8
+RESTART_KAFKA_EVERY_RUNS = 1 if PAPER_SIZES else 8
 
 API = "http://localhost:8080"
 CROWDNAV_CONTAINER = os.environ.get("CROWDNAV_CONTAINER", "crowdnav")
@@ -194,7 +197,8 @@ class RunnerConfig:
 
     # ================================ USER SPECIFIC CONFIG ================================
     """The name of the experiment."""
-    name:                       str             = "crowdnav_rtx_step_baseline"
+    name:                       str             = ("crowdnav_rtx_step_baseline_paper_sizes" if PAPER_SIZES
+                                                   else "crowdnav_rtx_step_baseline")
 
     """Results go to <this folder>/experiments/<name>/ (run_table.csv and one folder per run)."""
     results_output_path:        Path            = ROOT_DIR / 'experiments'

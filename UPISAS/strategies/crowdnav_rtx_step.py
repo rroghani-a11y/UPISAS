@@ -4,7 +4,10 @@
 from UPISAS.strategy import Strategy
 
 
-# one tenth of the sizes in the paper's Listing 4 (1000 and 5000), so the sweep fits in 10,000 ticks
+# sizes from the paper's Listing 4, only fit runs way longer than 10,000 ticks
+PAPER = {"first_samples_to_ignore": 1000, "sample_size": 5000}
+
+# one tenth of the paper, so the sweep fits in 10,000 ticks at 750 cars
 SCALED = {"first_samples_to_ignore": 100, "sample_size": 500}
 
 
